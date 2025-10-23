@@ -1,146 +1,142 @@
-# Lightweight Gaze Tracker for Raspberry Pi
+# ELEC 290 - Electronics and Computer Engineering Projects
 
-A very lightweight gaze tracking system that detects eye movements and prints gaze direction to the terminal. Designed specifically for Raspberry Pi with USB webcam.
+This repository contains projects developed for ELEC 290, focusing on computer vision and sensor technologies.
 
-## Features
+## Projects Overview
 
-- **Lightweight**: Optimized for Raspberry Pi performance
-- **Real-time**: Continuous gaze direction detection
-- **Terminal Output**: Prints gaze direction (LEFT, CENTER, RIGHT, BLINKING, NO_FACE)
-- **Blink Detection**: Distinguishes between gaze changes and blinking
-- **No GUI Required**: Runs headlessly for terminal-only operation
+### 1. Gaze Tracking System
+A lightweight gaze tracking system designed for real-time eye movement detection and direction analysis.
 
-## Gaze Directions
+**Features:**
+- Real-time gaze direction detection (LEFT, CENTER, RIGHT, UP, DOWN, and combinations)
+- Blink detection and face detection
+- Two implementation approaches:
+  - **Advanced**: Uses dlib with 68-point facial landmark detection (higher accuracy)
+  - **Simple**: Uses OpenCV Haar cascades (lighter weight, cross-platform)
+- Optimized for Raspberry Pi deployment
+- Terminal-based output for headless operation
 
-- `LEFT`: Looking to the left
-- `CENTER`: Looking straight ahead
-- `RIGHT`: Looking to the right
-- `BLINKING`: Eyes are closed/blinking
-- `NO_FACE`: No face detected in frame
+**Use Cases:**
+- Human-computer interaction research
+- Accessibility applications
+- Eye movement analysis
+- Hands-free device control
 
-## Installation
+### 2. Capacitive Touch Sensor
+A capacitive touch sensing system for detecting touch interactions.
 
-### 1. Install Dependencies
+**Status:** In development
 
-```bash
-pip install -r requirements.txt
-```
+## Quick Start
 
-### 2. Download Face Landmark Model
+### Gaze Tracking
 
-Download the dlib face landmark predictor model:
+1. **Clone the repository:**
+   ```bash
+   git clone <repository-url>
+   cd elec290
+   ```
 
-```bash
-wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
-bunzip2 shape_predictor_68_face_landmarks.dat.bz2
-```
+2. **Choose your implementation:**
+   - For **Raspberry Pi/Linux** (recommended): Use `gaze tracking/gaze_tracker.py`
+   - For **Cross-platform/Windows**: Use `gaze tracking/gaze_tracker_simple.py`
 
-Or manually download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+3. **Install dependencies:**
+   ```bash
+   cd "gaze tracking"
+   pip install -r requirements.txt
+   ```
 
-### 3. Raspberry Pi Specific Setup
+4. **For dlib version only** - Download the face landmark model:
+   ```bash
+   wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+   bunzip2 shape_predictor_68_face_landmarks.dat.bz2
+   ```
 
-For Raspberry Pi, you may need to install additional dependencies:
-
-```bash
-sudo apt-get update
-sudo apt-get install python3-opencv python3-pip
-sudo apt-get install libopenblas-dev liblapack-dev
-sudo apt-get install libx11-dev libgtk-3-dev libboost-python-dev
-```
-
-## Usage
-
-### Basic Usage
-
-```bash
-python3 gaze_tracker.py
-```
-
-### With Different Camera
-
-If you have multiple cameras, specify the camera index:
-
-```bash
-python3 gaze_tracker.py
-```
-
-The script will automatically use camera index 0 (default camera).
-
-### Headless Operation
-
-The script is designed to run without a display. The video window is commented out by default. If you want to see the video feed for debugging, uncomment the `cv2.imshow` line in the code.
-
-## Performance Optimization
-
-### For Raspberry Pi
-
-1. **Reduce Resolution**: Modify the camera resolution in the code if needed
-2. **Skip Frames**: Add frame skipping logic for better performance
-3. **Lower FPS**: Reduce processing frequency if CPU usage is too high
-
-### Example Optimizations
-
-```python
-# In the run() method, add frame skipping:
-frame_count = 0
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Process every 3rd frame for better performance
-    if frame_count % 3 == 0:
-        gaze_direction = self.process_frame(frame)
-        # ... rest of processing
-    
-    frame_count += 1
-```
-
-## Troubleshooting
-
-### Common Issues
-
-1. **"shape_predictor_68_face_landmarks.dat not found"**
-   - Download the model file as described in installation step 2
-
-2. **"Could not open camera"**
-   - Check if camera is connected and recognized
-   - Try different camera indices (0, 1, 2, etc.)
-   - On Linux: `ls /dev/video*` to list available cameras
-
-3. **Poor Performance on Raspberry Pi**
-   - Reduce camera resolution
-   - Add frame skipping
-   - Close other applications
-
-4. **No Face Detection**
-   - Ensure good lighting
-   - Face should be clearly visible
-   - Try adjusting camera angle
-
-### Camera Testing
-
-Test your camera separately:
-
-```python
-import cv2
-cap = cv2.VideoCapture(0)
-ret, frame = cap.read()
-print(f"Camera working: {ret}")
-cap.release()
-```
+5. **Run the tracker:**
+   ```bash
+   # For dlib version (Linux/Raspberry Pi)
+   python3 gaze_tracker.py
+   
+   # For simple version (cross-platform)
+   python3 gaze_tracker_simple.py
+   ```
 
 ## Technical Details
 
-- **Face Detection**: Uses dlib's HOG-based face detector
-- **Landmark Detection**: 68-point facial landmark model
-- **Gaze Calculation**: Based on eye corner and pupil position ratios
-- **Blink Detection**: Eye Aspect Ratio (EAR) thresholding
+### Gaze Tracking Algorithms
 
-## License
+**Advanced Implementation (dlib):**
+- Uses dlib's HOG-based face detector
+- 68-point facial landmark detection
+- Eye Aspect Ratio (EAR) for blink detection
+- Gaze ratio calculation based on eye corner and pupil positions
 
-This project is open source. The dlib library and its models have their own licensing terms.
+**Simple Implementation (OpenCV):**
+- Haar cascade classifiers for face and eye detection
+- Geometric analysis of eye positions relative to face center
+- Simplified blink detection based on eye visibility
+
+### Performance Considerations
+
+- **Raspberry Pi Optimization**: Frame skipping, reduced resolution
+- **Real-time Processing**: ~10-30 FPS depending on hardware
+- **Memory Usage**: Minimal footprint for embedded applications
+
+## Project Structure
+
+```
+elec290/
+├── README.md                           # This file
+├── gaze tracking/                      # Gaze tracking system
+│   ├── README.md                      # Detailed gaze tracking documentation
+│   ├── gaze_tracker.py                # Advanced dlib-based implementation
+│   ├── gaze_tracker_simple.py         # Simple OpenCV-based implementation
+│   └── requirements.txt               # Python dependencies
+└── capacitive touch sensor/           # Touch sensor project (in development)
+```
+
+## Dependencies
+
+### Gaze Tracking
+- **Core**: OpenCV, NumPy
+- **Advanced**: dlib (for facial landmark detection)
+- **Platform**: Python 3.7+
+
+### System Requirements
+- **Camera**: USB webcam or built-in camera
+- **OS**: Linux (recommended), Windows, macOS
+- **Hardware**: Raspberry Pi 3B+ or better (for embedded deployment)
+
+## Applications
+
+### Research & Development
+- Human-computer interaction studies
+- Eye movement pattern analysis
+- Accessibility technology development
+
+### Practical Applications
+- Hands-free device control
+- Driver attention monitoring
+- Gaming interfaces
+- Medical diagnostics
 
 ## Contributing
 
-Feel free to submit issues and enhancement requests!
+This is an academic project repository. For contributions or questions:
+1. Check existing issues
+2. Create detailed bug reports or feature requests
+3. Follow the existing code style and documentation standards
+
+## License
+
+This project is developed for educational purposes. Please respect the licensing terms of included libraries:
+- OpenCV: Apache 2.0 License
+- dlib: Boost Software License
+- NumPy: BSD License
+
+## Course Information
+
+**Course**: ELEC 290 - Electronics and Computer Engineering  
+**Focus**: Computer vision, sensor technologies, embedded systems  
+**Platform**: Cross-platform with Raspberry Pi optimization
