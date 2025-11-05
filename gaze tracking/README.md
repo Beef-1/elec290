@@ -66,9 +66,26 @@ python3 gaze_tracker.py
 
 The script will automatically use camera index 0 (default camera).
 
-### Headless Operation
+### Headless Operation and Gaze Point UI
 
-The script is designed to run without a display. The video window is commented out by default. If you want to see the video feed for debugging, uncomment the `cv2.imshow` line in the code.
+By default, the simple implementation (`gaze_tracker_simple.py`) displays a minimal "Gaze Point" window that shows a dot representing where your eyes are looking on a canvas. It does not show the camera feed.
+
+Controls in the Gaze Point UI:
+
+- `q`: Quit
+- `h`: Show help in terminal
+- `w` / `a` / `s` / `d`: Set top/left/bottom/right calibration edges to your CURRENT gaze
+- `c`: Set center calibration around your CURRENT gaze (re-centers ranges)
+
+Calibration tips:
+
+- Look at the top edge of your screen and press `w` (top)
+- Look at the bottom edge and press `s` (bottom)
+- Look at the left edge and press `a` (left)
+- Look at the right edge and press `d` (right)
+- Use `c` while looking at the center to re-center the mapping
+
+This maps your relative eye position to the canvas so the dot follows your gaze more accurately for your setup.
 
 ## Performance Optimization
 
