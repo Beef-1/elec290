@@ -4,11 +4,40 @@ Ultra-Lightweight Gaze Tracker for Raspberry Pi
 Uses only OpenCV for face and eye detection - no dlib required
 """
 
-import cv2
+import cv2  # type: ignore
 import numpy as np
 import time
 import os
 import warnings
+import sys
+
+try:
+    import mediapipe as mp  # type: ignore
+    _MEDIAPIPE_AVAILABLE = True
+except ImportError:
+    mp = None
+    _MEDIAPIPE_AVAILABLE = False
+
+try:
+    import psutil  # type: ignore
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    psutil = None
+    _PSUTIL_AVAILABLE = False
+
+try:
+    import winsound  # type: ignore
+    _WINSOUND_AVAILABLE = True
+except ImportError:
+    winsound = None
+    _WINSOUND_AVAILABLE = False
+
+try:
+    import msvcrt  # type: ignore
+    _MSVCRT_AVAILABLE = True
+except ImportError:
+    msvcrt = None
+    _MSVCRT_AVAILABLE = False
 
 # Suppress OpenCV warnings
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
@@ -25,14 +54,45 @@ class SimpleGazeTracker:
             print(f"ERROR: Could not load face cascade from {face_cascade_path}")
             raise RuntimeError("Face cascade classifier not loaded")
         
-        eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye.xml'
-        self.eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
+        # Load eye cascades (include eyeglasses-friendly model automatically)
+        self.eye_cascades = []
+        eye_cascade_specs = [
+            ('haarcascade_eye.xml', 'standard'),
+            ('haarcascade_eye_tree_eyeglasses.xml', 'eyeglasses')
+        ]
+        for filename, label in eye_cascade_specs:
+            cascade_path = cv2.data.haarcascades + filename
+            cascade = cv2.CascadeClassifier(cascade_path)
+            if cascade.empty():
+                print(f"WARNING: Could not load eye cascade {filename} from {cascade_path}")
+                continue
+            self.eye_cascades.append((label, cascade))
         
-        if self.eye_cascade.empty():
-            print(f"ERROR: Could not load eye cascade from {eye_cascade_path}")
-            raise RuntimeError("Eye cascade classifier not loaded")
+        if not self.eye_cascades:
+            raise RuntimeError("Eye cascade classifiers not loaded")
         
+        # Keep the first cascade for backward compatibility
+        self.eye_cascade = self.eye_cascades[0][1]
         print("Face and eye cascade classifiers loaded successfully.")
+        
+        # MediaPipe setup for robust landmark-based eye detection (handles glasses better)
+        self.use_mediapipe = False
+        self.mediapipe_face_mesh = None
+        if _MEDIAPIPE_AVAILABLE:
+            try:
+                self.mediapipe_face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5
+                )
+                self.use_mediapipe = True
+                print("MediaPipe FaceMesh enabled for eye detection (glasses support).")
+            except Exception as mp_err:
+                print(f"WARNING: Failed to initialize MediaPipe FaceMesh: {mp_err}")
+                self.use_mediapipe = False
+        else:
+            print("MediaPipe not available. Install 'mediapipe' for improved glasses support.")
         
         # Gaze direction thresholds
         self.HORIZONTAL_THRESHOLD = 0.3
@@ -52,24 +112,284 @@ class SimpleGazeTracker:
         # Debug mode - show camera feed
         self.debug_mode = False
         
+        # Eye detection state
+        self.last_eye_detector = None
+        self.last_valid_eyes = None
+        self.last_valid_eyes_frame = -100
+        self.eye_retention_frames = 5
+        self.last_relative_offsets = (0.0, 0.0)
+        self.console_line_length = 0
+        self.last_head_down = False
+        
+        # Memory usage limit (3 GB default) to avoid uncontrolled growth
+        self.memory_limit_bytes = 3 * 1024 * 1024 * 1024  # 3 GiB
+        
+        # Downward gaze monitoring
+        self.down_threshold_seconds = 1.0
+        self.down_beep_cooldown = 0.0  # seconds between beeps (repeat)
+        self.down_offset_threshold = 0.15  # relative Y threshold (more sensitive)
+        self.down_accumulator = 0.0
+        self.last_down_beep_time = None
+        self.last_frame_time = time.time()
+        self.head_eye_ratio_baseline = 0.42
+        self.head_face_ratio_baseline = 1.0
+        self.head_baseline_alpha = 0.15
+
+    def _check_memory_usage(self):
+        """Return tuple (exceeded, current_bytes)."""
+        if not _PSUTIL_AVAILABLE or psutil is None:
+            return False, 0
+        try:
+            process = psutil.Process(os.getpid())
+            rss = process.memory_info().rss
+            return rss > self.memory_limit_bytes, rss
+        except Exception:
+            return False, 0
+
+    def _mediapipe_detect_face_and_eyes(self, frame):
+        """Use MediaPipe FaceMesh to obtain face and eye bounding boxes."""
+        if not self.use_mediapipe or self.mediapipe_face_mesh is None:
+            return None
+        if frame is None or frame.size == 0:
+            return None
+        frame_h, frame_w = frame.shape[:2]
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.mediapipe_face_mesh.process(rgb_frame)
+        if not results.multi_face_landmarks:
+            return None
+        face_landmarks = results.multi_face_landmarks[0]
+        xs = [lm.x * frame_w for lm in face_landmarks.landmark]
+        ys = [lm.y * frame_h for lm in face_landmarks.landmark]
+        face_x_min = max(0, int(min(xs)))
+        face_y_min = max(0, int(min(ys)))
+        face_x_max = min(frame_w - 1, int(max(xs)))
+        face_y_max = min(frame_h - 1, int(max(ys)))
+        if face_x_max <= face_x_min or face_y_max <= face_y_min:
+            return None
+        face_w = face_x_max - face_x_min
+        face_h = face_y_max - face_y_min
+        # Eye landmark indices for MediaPipe FaceMesh
+        left_eye_indices = [33, 133, 160, 159, 158, 157, 173, 155, 154, 153, 145, 144]
+        right_eye_indices = [362, 263, 387, 386, 385, 384, 398, 382, 381, 380, 374, 373]
+        def compute_bbox(indexes):
+            x_vals = [face_landmarks.landmark[i].x * frame_w for i in indexes]
+            y_vals = [face_landmarks.landmark[i].y * frame_h for i in indexes]
+            x_min = max(face_x_min, int(min(x_vals)) - 2)
+            y_min = max(face_y_min, int(min(y_vals)) - 2)
+            x_max = min(face_x_max, int(max(x_vals)) + 2)
+            y_max = min(face_y_max, int(max(y_vals)) + 2)
+            if x_max <= x_min or y_max <= y_min:
+                return None
+            return (x_min - face_x_min,
+                    y_min - face_y_min,
+                    x_max - x_min,
+                    y_max - y_min)
+        left_eye_bbox = compute_bbox(left_eye_indices)
+        right_eye_bbox = compute_bbox(right_eye_indices)
+        if left_eye_bbox is None or right_eye_bbox is None:
+            return None
+        face_bbox = (face_x_min, face_y_min, face_w, face_h)
+        return face_bbox, left_eye_bbox, right_eye_bbox
+
     def detect_eyes_in_face(self, face_roi, gray_face):
-        """Detect eyes within a face region - more lenient for looking down"""
-        # Use more lenient parameters to detect eyes when looking down
-        eyes = self.eye_cascade.detectMultiScale(gray_face, 1.1, 3)  # Reduced minNeighbors from 4 to 3
+        """Detect eyes within a face region with automatic glasses handling."""
+        detections = []
+        # Parameter sets tuned for standard and glasses scenarios
+        param_sets = [
+            (1.10, 4, (28, 20)),
+            (1.06, 3, (24, 18)),
+            (1.03, 2, (18, 14))
+        ]
+        for label, cascade in self.eye_cascades:
+            for scale, neighbors, min_size in param_sets:
+                raw_eyes = cascade.detectMultiScale(
+                    gray_face,
+                    scaleFactor=scale,
+                    minNeighbors=neighbors,
+                    minSize=min_size,
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+                if len(raw_eyes) >= 2:
+                    dedup_eyes = self._deduplicate_rects(raw_eyes)
+                    if len(dedup_eyes) < 2:
+                        continue
+                    dedup_eyes = [eye for eye in dedup_eyes if self._is_valid_eye_box(eye, face_roi.shape)]
+                    if len(dedup_eyes) < 2:
+                        continue
+                    best_score = -np.inf
+                    best_pair = None
+                    for i in range(len(dedup_eyes)):
+                        for j in range(i + 1, len(dedup_eyes)):
+                            eye_pair = [tuple(map(int, dedup_eyes[i])), tuple(map(int, dedup_eyes[j]))]
+                            eye_pair.sort(key=lambda x: x[0])
+                            if not self._is_valid_eye_box(eye_pair[0], face_roi.shape):
+                                continue
+                            if not self._is_valid_eye_box(eye_pair[1], face_roi.shape):
+                                continue
+                            if not self._is_valid_eye_pair(eye_pair, face_roi.shape):
+                                continue
+                            score = self._score_eye_pair(eye_pair)
+                            if score > best_score:
+                                best_score = score
+                                best_pair = eye_pair
+                    if best_pair is not None:
+                        detections.append((best_score, best_pair, label))
+                        break
         
-        if len(eyes) >= 2:
-            # Sort eyes by x-coordinate (left to right)
-            eyes = sorted(eyes, key=lambda x: x[0])
-            return eyes[:2]  # Return only the first two eyes
+        if detections:
+            detections.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_eyes, label = detections[0]
+            self.last_eye_detector = label
+            return best_eyes, label
         
-        # If not enough eyes found, try with even more lenient settings
+        # Fallback: return the two best eyes ignoring strict validation to avoid total failure
+        for label, cascade in self.eye_cascades:
+            raw_eyes = cascade.detectMultiScale(
+                gray_face,
+                scaleFactor=1.05,
+                minNeighbors=2,
+                minSize=(20, 16),
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            if len(raw_eyes) >= 2:
+                dedup_eyes = self._deduplicate_rects(raw_eyes)
+                dedup_eyes = [eye for eye in dedup_eyes if self._is_valid_eye_box(eye, face_roi.shape, relaxed=True)]
+                if len(dedup_eyes) < 2:
+                    continue
+                pairs = []
+                for i in range(len(dedup_eyes)):
+                    for j in range(i + 1, len(dedup_eyes)):
+                        eye_pair = [tuple(map(int, dedup_eyes[i])), tuple(map(int, dedup_eyes[j]))]
+                        eye_pair.sort(key=lambda x: x[0])
+                        if not self._is_valid_eye_box(eye_pair[0], face_roi.shape, relaxed=True):
+                            continue
+                        if not self._is_valid_eye_box(eye_pair[1], face_roi.shape, relaxed=True):
+                            continue
+                        if not self._is_valid_eye_pair(eye_pair, face_roi.shape, relaxed=True):
+                            continue
+                        pairs.append(eye_pair)
+                if pairs:
+                    pairs.sort(key=lambda p: abs((p[1][0] + p[1][2]/2) - (p[0][0] + p[0][2]/2)), reverse=True)
+                    eyes = pairs[0]
+                    self.last_eye_detector = f"{label}-fallback"
+                    return eyes, label
+        return [], None
+        
+        self.last_eye_detector = None
+        return [], None
+
+    def _score_eye_pair(self, eyes):
+        """Score a pair of eyes to decide which detection is best."""
         if len(eyes) < 2:
-            eyes = self.eye_cascade.detectMultiScale(gray_face, 1.05, 2)
-            if len(eyes) >= 2:
-                eyes = sorted(eyes, key=lambda x: x[0])
-                return eyes[:2]
-        
-        return []
+            return -np.inf
+        left, right = eyes[0], eyes[1]
+        # Horizontal separation
+        left_center = (left[0] + left[2] / 2.0, left[1] + left[3] / 2.0)
+        right_center = (right[0] + right[2] / 2.0, right[1] + right[3] / 2.0)
+        separation = abs(right_center[0] - left_center[0])
+        # Alignment and size similarity
+        size_similarity = 1.0 / (1.0 + abs(left[2] - right[2]) + abs(left[3] - right[3]))
+        vertical_alignment = 1.0 / (1.0 + abs(right_center[1] - left_center[1]))
+        avg_area = (left[2] * left[3] + right[2] * right[3]) / 2.0
+        vertical_offset = abs(right_center[1] - left_center[1])
+        vertical_penalty = max(0.0, vertical_offset - 15.0) * 3.0
+        return separation + 0.05 * avg_area + 50 * size_similarity + 50 * vertical_alignment - vertical_penalty
+
+    def _is_valid_eye_box(self, eye, face_shape, relaxed=False):
+        """Validate individual eye candidate bounding box."""
+        if eye is None:
+            return False
+        face_h, face_w = face_shape[:2]
+        x, y, w, h = eye
+        if w <= 0 or h <= 0:
+            return False
+        aspect = float(w) / float(h)
+        if aspect < (0.85 if relaxed else 0.95):
+            return False
+        if aspect > 4.0:
+            return False
+        area = w * h
+        face_area = max(1, face_h * face_w)
+        min_area_ratio = 0.005 if relaxed else 0.008
+        max_area_ratio = 0.12 if relaxed else 0.08
+        ratio = float(area) / float(face_area)
+        if ratio < min_area_ratio or ratio > max_area_ratio:
+            return False
+        center_y = y + h / 2.0
+        vertical_ratio = center_y / max(1.0, float(face_h))
+        min_vertical = 0.16 if relaxed else 0.20
+        max_vertical = 0.65 if relaxed else 0.55
+        if vertical_ratio < min_vertical or vertical_ratio > max_vertical:
+            return False
+        return True
+
+    def _is_valid_eye_pair(self, eyes, face_shape, relaxed=False):
+        """Filter out implausible eye pair combinations."""
+        if len(eyes) != 2:
+            return False
+        face_h, face_w = face_shape[:2]
+        left, right = eyes[0], eyes[1]
+        left_center = (left[0] + left[2] / 2.0, left[1] + left[3] / 2.0)
+        right_center = (right[0] + right[2] / 2.0, right[1] + right[3] / 2.0)
+        horizontal_sep = abs(right_center[0] - left_center[0])
+        vertical_sep = abs(right_center[1] - left_center[1])
+
+        avg_eye_width = (left[2] + right[2]) / 2.0
+        avg_eye_height = (left[3] + right[3]) / 2.0
+
+        min_horizontal_ratio = 0.18 if relaxed else 0.2
+        min_horizontal = max(12.0, min_horizontal_ratio * face_w, 0.6 * avg_eye_width)
+        max_vertical_ratio = 0.45 if relaxed else 0.3
+        max_vertical = max(12.0, max_vertical_ratio * face_h, 1.8 * avg_eye_height)
+        if horizontal_sep < min_horizontal:
+            return False
+        if vertical_sep > max_vertical:
+            return False
+        # Reject overlapping boxes heavily
+        overlap_x = max(0, min(left[0] + left[2], right[0] + right[2]) - max(left[0], right[0]))
+        overlap_y = max(0, min(left[1] + left[3], right[1] + right[3]) - max(left[1], right[1]))
+        overlap_area = overlap_x * overlap_y
+        left_area = left[2] * left[3]
+        right_area = right[2] * right[3]
+        overlap_threshold = 0.6 if relaxed else 0.4
+        if overlap_area > overlap_threshold * min(left_area, right_area):
+            return False
+        return True
+
+    def _intersection_over_union(self, rect_a, rect_b):
+        """Compute Intersection over Union of two rectangles."""
+        ax, ay, aw, ah = rect_a
+        bx, by, bw, bh = rect_b
+        ax2, ay2 = ax + aw, ay + ah
+        bx2, by2 = bx + bw, by + bh
+
+        inter_x1 = max(ax, bx)
+        inter_y1 = max(ay, by)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        if inter_x2 <= inter_x1 or inter_y2 <= inter_y1:
+            return 0.0
+
+        inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+        area_a = aw * ah
+        area_b = bw * bh
+        denom = float(area_a + area_b - inter_area)
+        if denom <= 0:
+            return 0.0
+        return inter_area / denom
+
+    def _deduplicate_rects(self, rects, overlap_threshold=0.6):
+        """Remove duplicate detections that heavily overlap."""
+        if rects is None or len(rects) == 0:
+            return []
+        rect_list = [tuple(map(int, r)) for r in rects]
+        rect_list.sort(key=lambda r: r[2] * r[3], reverse=True)
+        filtered = []
+        for rect in rect_list:
+            if all(self._intersection_over_union(rect, kept) <= overlap_threshold for kept in filtered):
+                filtered.append(rect)
+        return filtered
     
     def calculate_eye_aspect_ratio(self, eye_bbox):
         """Calculate Eye Aspect Ratio (EAR) for blink detection - works even when looking down"""
@@ -235,6 +555,14 @@ class SimpleGazeTracker:
         left_eye_roi, left_offset = self.get_eye_region_from_bbox(left_eye, face_roi)
         right_eye_roi, right_offset = self.get_eye_region_from_bbox(right_eye, face_roi)
         
+        # Guard against empty ROIs (can happen due to partial detections)
+        if (left_eye_roi is None or left_eye_roi.size == 0 or left_eye_roi.shape[0] == 0 or left_eye_roi.shape[1] == 0 or
+                right_eye_roi is None or right_eye_roi.size == 0 or right_eye_roi.shape[0] == 0 or right_eye_roi.shape[1] == 0):
+            # Fallback to most recent offsets if available, otherwise neutral
+            if hasattr(self, 'last_relative_offsets'):
+                return self.last_relative_offsets
+            return 0.0, 0.0
+        
         # Convert to grayscale if needed
         if len(left_eye_roi.shape) == 3:
             left_gray = cv2.cvtColor(left_eye_roi, cv2.COLOR_BGR2GRAY)
@@ -312,7 +640,10 @@ class SimpleGazeTracker:
         # Allow horizontal to go beyond ±1.0 for better edge calibration (will be clipped later)
         relative_x = float(horizontal_offset)
         relative_y = float(np.clip(blended_vertical, -1.5, 1.5))
-
+        
+        # Store for fallback usage
+        self.last_relative_offsets = (relative_x, relative_y)
+        
         return relative_x, relative_y
     
     def detect_blinking(self, left_eye, right_eye):
@@ -334,121 +665,179 @@ class SimpleGazeTracker:
     
     def process_frame(self, frame):
         """Process a single frame and return gaze direction"""
-        # Resize frame if too large for better detection performance
         height, width = frame.shape[:2]
-        if width > 640:
-            scale = 640.0 / width
-            new_width = int(width * scale)
-            new_height = int(height * scale)
-            frame_resized = cv2.resize(frame, (new_width, new_height))
-        else:
-            frame_resized = frame
+        eyes = []
+        label = None
+        face = None
+        face_roi = None
+        gray_face = None
+        used_mediapipe = False
+
+        # First try MediaPipe landmark-based detection for more robust eye tracking (glasses support)
+        if self.use_mediapipe:
+            mp_result = self._mediapipe_detect_face_and_eyes(frame)
+            if mp_result:
+                face_bbox, left_eye_bbox, right_eye_bbox = mp_result
+                fx, fy, fw, fh = face_bbox
+                fx = max(0, min(fx, width - 1))
+                fy = max(0, min(fy, height - 1))
+                fw = min(fw, width - fx)
+                fh = min(fh, height - fy)
+                if fw > 10 and fh > 10:
+                    candidate_face_roi = frame[fy:fy+fh, fx:fx+fw]
+                    if candidate_face_roi.size > 0:
+                        face_roi = candidate_face_roi
+                        gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+                        eyes = [left_eye_bbox, right_eye_bbox]
+                        label = "mediapipe"
+                        face = (fx, fy, fw, fh)
+                        used_mediapipe = True
+                        self.last_eye_detector = label
+
+        # Fallback to Haar cascades if MediaPipe failed or not available
+        if not used_mediapipe:
             scale = 1.0
-        
-        gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
-        
-        # Equalize histogram for better contrast (helps with face detection)
-        gray = cv2.equalizeHist(gray)
-        
-        # Detect faces with very lenient parameters
-        # Try multiple scale factors and minNeighbors for better detection
-        faces = self.face_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.05,  # Smaller scale factor = more sensitive
-            minNeighbors=2,    # Very low = more sensitive (was 3)
-            minSize=(30, 30),  # Minimum face size
-            flags=cv2.CASCADE_SCALE_IMAGE
-        )
-        
-        # If no faces found, try even more lenient settings
-        if len(faces) == 0:
+            frame_resized = frame
+            if width > 640:
+                scale = 640.0 / width
+                frame_resized = cv2.resize(frame, (int(width * scale), int(height * scale)))
+            gray = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+
             faces = self.face_cascade.detectMultiScale(
                 gray,
-                scaleFactor=1.02,  # Even smaller
-                minNeighbors=1,    # Minimum required
-                minSize=(20, 20),
+                scaleFactor=1.05,
+                minNeighbors=2,
+                minSize=(30, 30),
                 flags=cv2.CASCADE_SCALE_IMAGE
             )
-        
-        # If still no faces, try without minSize constraint
-        if len(faces) == 0:
-            faces = self.face_cascade.detectMultiScale(
-                gray,
-                scaleFactor=1.01,
-                minNeighbors=1,
-                flags=cv2.CASCADE_SCALE_IMAGE
-            )
-        
-        if len(faces) == 0:
-            debug_frame = None
-            if self.debug_mode:
-                debug_frame = frame_resized.copy()
+
+            if len(faces) == 0:
+                faces = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.02,
+                    minNeighbors=1,
+                    minSize=(20, 20),
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+
+            if len(faces) == 0:
+                faces = self.face_cascade.detectMultiScale(
+                    gray,
+                    scaleFactor=1.01,
+                    minNeighbors=1,
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+
+            if len(faces) == 0:
+                debug_frame = frame.copy()
                 cv2.putText(debug_frame, "NO FACE DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
                 cv2.putText(debug_frame, "Check lighting and positioning", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            return "NO_FACE", (0.0, 0.0), debug_frame
-        
-        # Scale face coordinates back if frame was resized
-        if scale != 1.0:
-            faces = [(int(x/scale), int(y/scale), int(w/scale), int(h/scale)) for (x, y, w, h) in faces]
-            # Extract face from original frame
+                self.last_head_down = False
+                return "NO_FACE", (0.0, 0.0), debug_frame, False
+
+            if scale != 1.0:
+                faces = [(int(x / scale), int(y / scale), int(w / scale), int(h / scale)) for (x, y, w, h) in faces]
+
             face = faces[0]
-            x, y, w, h = face
-            if x + w > width or y + h > height:
-                # Adjust if out of bounds
-                x = max(0, min(x, width - w))
-                y = max(0, min(y, height - h))
-                w = min(w, width - x)
-                h = min(h, height - y)
-            face_roi = frame[y:y+h, x:x+w]
+            fx, fy, fw, fh = face
+            fx = max(0, min(fx, width - 1))
+            fy = max(0, min(fy, height - 1))
+            fw = min(fw, width - fx)
+            fh = min(fh, height - fy)
+            if fw <= 0 or fh <= 0:
+                debug_frame = frame.copy()
+                cv2.putText(debug_frame, "INVALID FACE REGION", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                self.last_head_down = False
+                return "NO_FACE", (0.0, 0.0), debug_frame, False
+            face_roi = frame[fy:fy+fh, fx:fx+fw]
+            if face_roi.size == 0:
+                debug_frame = frame.copy()
+                cv2.putText(debug_frame, "EMPTY FACE ROI", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                self.last_head_down = False
+                return "NO_FACE", (0.0, 0.0), debug_frame, False
             gray_face = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+            eyes, label = self.detect_eyes_in_face(face_roi, gray_face)
+
+        # Reuse recent detections if current detection failed (helps with glasses glare)
+        if len(eyes) < 2 and self.last_valid_eyes is not None:
+            if (self.frame_counter - self.last_valid_eyes_frame) <= self.eye_retention_frames:
+                eyes = [tuple(eye) for eye in self.last_valid_eyes]
+                label = label or "cached"
+                self.last_eye_detector = label if label == "cached" else f"{label}+cached"
+            else:
+                self.last_eye_detector = label
         else:
-            # Use the first detected face from resized frame
-            face = faces[0]
-            x, y, w, h = face
-            face_roi = frame_resized[y:y+h, x:x+w]
-            gray_face = gray[y:y+h, x:x+w]
-        
-        # Detect eyes within the face
-        eyes = self.detect_eyes_in_face(face_roi, gray_face)
-        
-        if len(eyes) >= 2:
+            if label:
+                self.last_eye_detector = label
+
+        if len(eyes) >= 2 and face_roi is not None and gray_face is not None:
             left_eye = eyes[0]
             right_eye = eyes[1]
-            
+
+            # Keep track of the most recent reliable detection
+            self.last_valid_eyes = [tuple(eye) for eye in eyes]
+            self.last_valid_eyes_frame = self.frame_counter
+
             # Check for blinking using EAR (works even when looking down)
             if self.detect_blinking(left_eye, right_eye):
-                debug_frame = None
-                if self.debug_mode:
-                    debug_frame = frame_resized.copy() if scale != 1.0 else frame.copy()
-                    face = faces[0]
-                    if scale != 1.0:
-                        x, y, w, h = (int(f/scale) for f in face)
-                    else:
-                        x, y, w, h = face
-                    cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-                    cv2.putText(debug_frame, "BLINKING", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-                return "BLINKING", (0.0, 0.0), debug_frame
-            
+                debug_frame = frame.copy()
+                if face is not None:
+                    fx, fy, fw, fh = face
+                    cv2.rectangle(debug_frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
+                    for eye in [left_eye, right_eye]:
+                        eye_x = fx + eye[0]
+                        eye_y = fy + eye[1]
+                        eye_w = eye[2]
+                        eye_h = eye[3]
+                        cv2.rectangle(debug_frame, (eye_x, eye_y), (eye_x + eye_w, eye_y + eye_h), (255, 0, 0), 2)
+                cv2.putText(debug_frame, "BLINKING", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+                self.last_head_down = False
+                return "BLINKING", (0.0, 0.0), debug_frame, False
+
             gaze_direction = self.calculate_gaze_direction(left_eye, right_eye, face_roi)
             rel_x, rel_y = self.compute_relative_eye_offsets(left_eye, right_eye, face_roi, gray_face)
-            
+
             # Apply temporal smoothing
             self.gaze_history.append((rel_x, rel_y))
             if len(self.gaze_history) > self.max_history:
                 self.gaze_history.pop(0)
-            
-            # Average the history
+
             smoothed_x = np.mean([g[0] for g in self.gaze_history])
             smoothed_y = np.mean([g[1] for g in self.gaze_history])
-            
-            return gaze_direction, (smoothed_x, smoothed_y)
-        
+
+            debug_frame = frame.copy()
+            if face is not None:
+                fx, fy, fw, fh = face
+                cv2.rectangle(debug_frame, (fx, fy), (fx + fw, fy + fh), (0, 255, 0), 2)
+                for eye in [left_eye, right_eye]:
+                    eye_x = fx + eye[0]
+                    eye_y = fy + eye[1]
+                    eye_w = eye[2]
+                    eye_h = eye[3]
+                    cv2.rectangle(debug_frame, (eye_x, eye_y), (eye_x + eye_w, eye_y + eye_h), (255, 0, 0), 2)
+                cv2.putText(debug_frame, f"Gaze: {gaze_direction}", (fx, max(20, fy - 15)),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                detector_label = self.last_eye_detector or "unknown"
+                cv2.putText(debug_frame, f"Eye detector: {detector_label}", (fx, fy + fh + 25),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            head_down = self._estimate_head_down(face_roi, left_eye, right_eye, smoothed_y)
+            self.last_head_down = head_down
+
+            return gaze_direction, (smoothed_x, smoothed_y), debug_frame, head_down
+
         # If no eyes, still add to history but with zero (maintains smoothing)
         self.gaze_history.append((0.0, 0.0))
         if len(self.gaze_history) > self.max_history:
             self.gaze_history.pop(0)
-        
-        return "NO_EYES", (0.0, 0.0)
+
+        debug_frame = frame.copy()
+        if self.debug_mode:
+            cv2.putText(debug_frame, "NO EYES DETECTED", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        self.last_head_down = False
+        return "NO_EYES", (0.0, 0.0), debug_frame, False
     
     def list_cameras(self):
         """List available cameras with better error handling"""
@@ -493,7 +882,7 @@ class SimpleGazeTracker:
         sys.stderr = old_stderr
         return available
     
-    def run(self, camera_index=None):
+    def run(self, camera_index=None, headless=False):
         """Main loop to capture video and track gaze and display gaze point UI"""
         # If no camera specified, try to find one
         if camera_index is None:
@@ -509,44 +898,11 @@ class SimpleGazeTracker:
             if len(available) > 1:
                 print(f"Using camera {camera_index} (first available). Use --camera <index> to specify another.")
         
-        # Try different backends for Windows compatibility
-        # On Windows, prefer DirectShow over Media Foundation to avoid index issues
-        import platform, os
-        if platform.system() == 'Windows':
-            os.environ["OPENCV_VIDEOIO_PRIORITY_MSMF"] = "0"
-        cap = None
-        backends = [
-            (cv2.CAP_ANY, "Auto-detect"),
-            (cv2.CAP_DSHOW, "DirectShow"),
-            (cv2.CAP_MSMF, "Media Foundation"),
-        ]
+        # Simple camera opening - same as test script that works
+        print(f"Opening camera {camera_index}...")
+        cap = cv2.VideoCapture(camera_index)
         
-        for backend_id, backend_name in backends:
-            try:
-                cap = cv2.VideoCapture(camera_index, backend_id)
-                if cap.isOpened():
-                    # Test if we can actually read a frame
-                    ret, test_frame = cap.read()
-                    if ret and test_frame is not None and test_frame.size > 0:
-                        print(f"Camera opened successfully using {backend_name}")
-                        break
-                    else:
-                        cap.release()
-                        cap = None
-            except Exception as e:
-                if cap:
-                    cap.release()
-                cap = None
-                continue
-        
-        # Final fallback: try without specifying backend
-        if (cap is None or not cap.isOpened()):
-            tmp = cv2.VideoCapture(camera_index)
-            if tmp.isOpened():
-                cap = tmp
-                print("Camera opened successfully using default backend")
-
-        if cap is None or not cap.isOpened():
+        if not cap.isOpened():
             print(f"Error: Could not open camera {camera_index}")
             print("\nTroubleshooting:")
             print("  1. Make sure your webcam is connected and not in use by another app")
@@ -555,39 +911,44 @@ class SimpleGazeTracker:
             print("  4. Try specifying a different camera: --list to see available cameras")
             return
         
-        # Set camera resolution for better performance
-        # Suppress warnings during property setting
+        # Read a few frames to initialize (like test script)
+        print("Initializing camera...")
+        for i in range(5):
+            ret, test_frame = cap.read()
+            if ret and test_frame is not None:
+                brightness = np.mean(test_frame)
+                print(f"Frame {i+1}: brightness = {brightness:.2f}")
+                if brightness > 5.0:
+                    print("Camera initialized successfully!")
+                    break
+            time.sleep(0.1)
+        
+        # Try to set resolution (but don't fail if it doesn't work)
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            try:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            except:
+                pass
         
         print("Simple Gaze Tracker Started!")
-        print("Press 'q' to quit | 'h' for help | 'w/a/s/r' to calibrate edges (up/left/down/right) | 'c' center | 'd' toggle debug (camera feed)")
+        print("Press 'q' to quit | 'h' for help | 'w/a/s/r' to calibrate edges (up/left/down/right) | 'c' center")
         print("Gaze directions: LEFT, CENTER, RIGHT, UP, DOWN, UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT, BLINKING, NO_FACE, NO_EYES")
         print("-" * 80)
+
+        if headless:
+            print("Console mode active: gaze status will update on this line.")
+            print("Controls: q quit | h help | w/a/s/r edges | c center")
+            self.console_line_length = 0
+            original_frame_skip = self.frame_skip
+            self.frame_skip = 1
+        else:
+            cv2.namedWindow('Eye Tracker - Camera Feed', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Eye Tracker - Camera Feed', 640, 480)
         
         last_direction = None
-        direction_count = 0
-
-        # Gaze point visualizer: a simple 800x600 canvas where we draw a dot
-        canvas_w, canvas_h = 800, 600
-        bg_color = (20, 20, 20)
-        dot_color = (0, 255, 255)
-        help_color = (200, 200, 200)
-
-        def map_relative_to_canvas(rel_xy):
-            # Clamp using calibration ranges, then scale to canvas
-            rel = np.array(rel_xy, dtype=np.float32)
-            # Avoid zero range by ensuring max>min
-            rng = np.maximum(self.calib_max - self.calib_min, 1e-3)
-            norm = (rel - self.calib_min) / rng  # [0,1]
-            norm = np.clip(norm, 0.0, 1.0)
-            x_px = int(norm[0] * (canvas_w - 1))
-            y_px = int(norm[1] * (canvas_h - 1))
-            return x_px, y_px
         
         consecutive_failures = 0
         max_failures = 10
@@ -607,95 +968,136 @@ class SimpleGazeTracker:
                 
                 consecutive_failures = 0  # Reset on successful read
                 
+                # Debug: Print frame info on first successful read and check if frame has content
+                if not hasattr(self, 'frame_info_printed'):
+                    print(f"Frame read successfully! Shape: {frame.shape}, Size: {frame.size}, Dtype: {frame.dtype}")
+                    # Check if frame is all black
+                    frame_mean = np.mean(frame)
+                    print(f"Frame mean brightness: {frame_mean:.2f} (0=black, 255=white)")
+                    if frame_mean < 1.0:
+                        print("WARNING: Frame appears to be completely black!")
+                    self.frame_info_printed = True
+                
+                display_frame = frame.copy() if not headless else None
+                
                 # Frame skipping - only process every Nth frame
                 self.frame_counter += 1
                 if self.frame_counter % self.frame_skip != 0:
                     # Still update display but use last processed gaze values
                     if not hasattr(self, 'last_gaze_result'):
-                        continue  # Skip display if we haven't processed anything yet
+                        if headless:
+                            self._print_console_status("INITIALIZING", (0.0, 0.0))
+                            time.sleep(0.01)
+                        else:
+                            cv2.putText(display_frame, "Initializing...", (10, 30), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                            cv2.imshow('Eye Tracker - Camera Feed', display_frame)
+                            cv2.waitKey(1)
+                        continue  # Skip processing if no previous result
                     result = self.last_gaze_result
                 else:
                     # Process frame
                     result = self.process_frame(frame)
-                    
                     # Store for frame skipping
                     self.last_gaze_result = result
                 
-                # Unpack result (may include debug frame)
-                if isinstance(result, tuple) and len(result) == 3:
-                    gaze_direction, rel, debug_frame = result
-                elif isinstance(result, tuple) and len(result) == 2:
-                    gaze_direction, rel = result
-                    debug_frame = None
+                head_down = getattr(self, "last_head_down", False)
+
+                # Unpack result (may include debug frame and head pose)
+                if isinstance(result, tuple):
+                    if len(result) == 4:
+                        gaze_direction, rel, debug_frame, head_down = result
+                        if not headless and debug_frame is not None and debug_frame.size > 0:
+                            display_frame = debug_frame.copy()
+                    elif len(result) == 3:
+                        gaze_direction, rel, debug_frame = result
+                        if not headless and debug_frame is not None and debug_frame.size > 0:
+                            display_frame = debug_frame.copy()
+                        head_down = getattr(self, "last_head_down", False)
+                    elif len(result) == 2:
+                        gaze_direction, rel = result
+                        head_down = getattr(self, "last_head_down", False)
+                    else:
+                        gaze_direction = result[0]
+                        rel = result[1] if len(result) > 1 else (0.0, 0.0)
                 else:
                     gaze_direction, rel = result, (0.0, 0.0)
-                    debug_frame = None
+                    head_down = getattr(self, "last_head_down", False)
                 
-                # Only print when direction changes to reduce spam
+                self.last_head_down = head_down
+                
+                # Only print when direction changes to reduce spam (GUI mode)
                 if gaze_direction != last_direction:
-                    timestamp = time.strftime("%H:%M:%S")
-                    print(f"[{timestamp}] Gaze: {gaze_direction}")
+                    if not headless:
+                        timestamp = time.strftime("%H:%M:%S")
+                        print(f"[{timestamp}] Gaze: {gaze_direction}")
                     last_direction = gaze_direction
-                # Build gaze point canvas
-                canvas = np.full((canvas_h, canvas_w, 3), bg_color, dtype=np.uint8)
                 
-                # Show face detection status
-                status_color = (0, 255, 0) if gaze_direction != "NO_FACE" else (0, 0, 255)
-                status_text = f"Status: {gaze_direction}"
-                if gaze_direction == "NO_FACE":
-                    status_text += " - Make sure face is clearly visible with good lighting"
+                # Update down-gaze timer
+                if isinstance(rel, (tuple, list)) and len(rel) >= 2:
+                    self._update_down_timer(gaze_direction, rel[1])
+                else:
+                    self._update_down_timer(gaze_direction, 0.0)
                 
-                x_px, y_px = map_relative_to_canvas(rel)
-                if gaze_direction != "NO_FACE":
-                    cv2.circle(canvas, (x_px, y_px), 10, dot_color, -1)
-                
-                cv2.putText(canvas, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-                cv2.putText(canvas, f"Gaze: {gaze_direction}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, help_color, 2)
-                cv2.putText(canvas, "Controls: q quit | h help | w/a/s/r edges | c center | d debug", (10, canvas_h-15), cv2.FONT_HERSHEY_SIMPLEX, 0.6, help_color, 1)
-
-                cv2.imshow('Gaze Point', canvas)
-                
-                # Show debug camera feed if enabled
-                if self.debug_mode and debug_frame is not None:
-                    cv2.imshow('Debug Camera Feed', debug_frame)
-                elif self.debug_mode:
-                    # Show regular frame if no debug frame
-                    cv2.imshow('Debug Camera Feed', frame)
-                
-                # Break on 'q' key press
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('h'):
-                    print("Help: Use w(up), s(down), a(left), r(right) to set calibration edges to the CURRENT gaze; c sets the center (averages); d toggles debug camera feed.")
-                elif key == ord('d'):
-                    # Toggle debug mode (press 'd' key)
-                    self.debug_mode = not self.debug_mode
-                    if self.debug_mode:
-                        print("Debug mode ON - Camera feed window will show face detection")
+                if headless:
+                    self.last_head_down = head_down
+                    self._print_console_status(gaze_direction, rel)
+                else:
+                    # Add status text overlay to display frame
+                    if display_frame is not None and display_frame.size > 0:
+                        status_color = (0, 255, 0) if gaze_direction != "NO_FACE" else (0, 0, 255)
+                        cv2.putText(display_frame, f"Status: {gaze_direction}", (10, display_frame.shape[0] - 40), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
+                        detector_label = self.last_eye_detector or "unknown"
+                        cv2.putText(display_frame, f"Eye detector: {detector_label}", (10, display_frame.shape[0] - 65), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+                        head_msg = "Head: DOWN" if head_down else "Head: UP"
+                        cv2.putText(display_frame, head_msg, (10, display_frame.shape[0] - 15),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+                        cv2.putText(display_frame, "Controls: q quit | h help | w/a/s/r edges | c center", 
+                                    (10, display_frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                        cv2.imshow('Eye Tracker - Camera Feed', display_frame)
                     else:
-                        print("Debug mode OFF")
-                        cv2.destroyWindow('Debug Camera Feed')
-                elif key == ord('a'):
-                    # set left edge (only if not in debug toggle)
-                    if not (cv2.waitKey(1) & 0xFF == ord('d')):  # Check if d was just pressed
-                        self.calib_min[0] = rel[0]
-                        print(f"Calib left set to {self.calib_min[0]:.3f}")
-                elif key == ord('r'):  # Changed from 'd' to 'r' for right edge to avoid conflict
-                    # set right edge
+                        # Fallback: create a test pattern if frame is invalid
+                        print("Warning: Invalid frame, creating test pattern")
+                        test_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                        cv2.putText(test_frame, "No valid frame", (50, 240), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                        cv2.imshow('Eye Tracker - Camera Feed', test_frame)
+                
+                # Monitor memory usage and enforce limit
+                exceeded, current_mem = self._check_memory_usage()
+                if exceeded:
+                    print(f"Memory limit exceeded: {current_mem / (1024**3):.2f} GiB > {self.memory_limit_bytes / (1024**3):.2f} GiB")
+                    print("Stopping gaze tracker to avoid excessive RAM usage.")
+                    break
+                
+                # Handle keyboard input
+                if headless:
+                    key_input = self._poll_console_key()
+                else:
+                    key_code = cv2.waitKey(1)
+                    key_input = key_code if key_code != -1 else None
+                key_char = self._translate_key_value(key_input)
+                can_calibrate = isinstance(rel, (tuple, list)) and len(rel) >= 2
+                
+                if key_char == 'q':
+                    break
+                elif key_char == 'h':
+                    print("Help: Use w(up), s(down), a(left), r(right) to set calibration edges to the CURRENT gaze; c sets the center (averages).")
+                elif key_char == 'a' and can_calibrate:
+                    self.calib_min[0] = rel[0]
+                    print(f"Calib left set to {self.calib_min[0]:.3f}")
+                elif key_char == 'r' and can_calibrate:
                     self.calib_max[0] = rel[0]
                     print(f"Calib right set to {self.calib_max[0]:.3f}")
-                elif key == ord('w'):
-                    # set top edge
+                elif key_char == 'w' and can_calibrate:
                     self.calib_min[1] = rel[1]
                     print(f"Calib top set to {self.calib_min[1]:.3f}")
-                elif key == ord('s'):
-                    # set bottom edge
+                elif key_char == 's' and can_calibrate:
                     self.calib_max[1] = rel[1]
                     print(f"Calib bottom set to {self.calib_max[1]:.3f}")
-                elif key == ord('c'):
-                    # set center as midpoint of current min/max based on current rel
-                    # We adjust min/max symmetrically around current rel
+                elif key_char == 'c' and can_calibrate:
                     span_x = max(0.2, (self.calib_max[0] - self.calib_min[0]))
                     span_y = max(0.2, (self.calib_max[1] - self.calib_min[1]))
                     self.calib_min[0] = rel[0] - span_x/2
@@ -708,41 +1110,183 @@ class SimpleGazeTracker:
             print("\nStopping gaze tracker...")
         
         finally:
-            cap.release()
+            if cap:
+                cap.release()
+            if headless:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self.frame_skip = original_frame_skip
             cv2.destroyAllWindows()
+            if self.use_mediapipe and self.mediapipe_face_mesh is not None:
+                try:
+                    self.mediapipe_face_mesh.close()
+                except Exception:
+                    pass
+
+    def _trigger_down_beep(self):
+        """Play an audible alert if available when user looks down too long."""
+        if _WINSOUND_AVAILABLE and winsound is not None:
+            try:
+                winsound.Beep(880, 300)  # frequency in Hz, duration in ms
+            except RuntimeError:
+                pass
+        else:
+            # Fallback: console bell
+            print('\a', end='', flush=True)
+
+    def _update_down_timer(self, gaze_direction, rel_y):
+        """Accumulate time spent looking down and trigger alert when threshold exceeded."""
+        now = time.time()
+        dt = max(0.0, now - self.last_frame_time)
+        self.last_frame_time = now
+        down_directions = {"DOWN", "DOWN_LEFT", "DOWN_RIGHT"}
+        is_down = gaze_direction in down_directions or rel_y > self.down_offset_threshold
+        if is_down:
+            self.down_accumulator += dt
+            if self.down_accumulator >= self.down_threshold_seconds:
+                if (self.last_down_beep_time is None or
+                        now - self.last_down_beep_time >= self.down_beep_cooldown):
+                    self._trigger_down_beep()
+                    self.last_down_beep_time = now
+                    # leave accumulator as-is so we only beep again after cooldown
+        else:
+            # Allow accumulator to decay toward zero to avoid immediate trigger on brief glances
+            self.down_accumulator = max(0.0, self.down_accumulator - dt)
+
+    def _translate_key_value(self, key_value):
+        """Normalize key inputs from OpenCV or console polling into lowercase chars."""
+        if key_value is None:
+            return None
+        if isinstance(key_value, str):
+            return key_value.lower()
+        if isinstance(key_value, int):
+            if key_value < 0:
+                return None
+            key_value &= 0xFF
+            if key_value in (0xFF, 0x00):
+                return None
+            try:
+                ch = chr(key_value)
+            except (ValueError, OverflowError):
+                return None
+            return ch.lower()
+        return None
+
+    def _poll_console_key(self):
+        """Non-blocking console key poll for headless mode."""
+        if _MSVCRT_AVAILABLE and msvcrt is not None:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ('\000', '\xe0'):
+                    # Special key prefix, consume second char and ignore
+                    if msvcrt.kbhit():
+                        msvcrt.getwch()
+                    return None
+                return ch.lower()
+            return None
+        try:
+            import select  # type: ignore
+        except ImportError:
+            return None
+        try:
+            if select.select([sys.stdin], [], [], 0)[0]:
+                ch = sys.stdin.read(1)
+                return ch.lower()
+        except Exception:
+            return None
+        return None
+
+    def _print_console_status(self, gaze_direction, rel):
+        """Display gaze information on a single console line."""
+        if isinstance(rel, (tuple, list)) and len(rel) >= 2:
+            rel_x, rel_y = float(rel[0]), float(rel[1])
+        else:
+            rel_x = rel_y = 0.0
+        detector_label = self.last_eye_detector or "unknown"
+        head_status = "HEAD_DOWN" if getattr(self, "last_head_down", False) else "HEAD_UP "
+        status = (
+            f"Gaze: {gaze_direction:<12} "
+            f"rel=({rel_x:+0.3f},{rel_y:+0.3f}) "
+            f"detector={detector_label} "
+            f"{head_status}"
+        )
+        padding = max(0, self.console_line_length - len(status))
+        sys.stdout.write("\r" + status + " " * padding)
+        sys.stdout.flush()
+        self.console_line_length = max(self.console_line_length, len(status))
+
+    def _estimate_head_down(self, face_roi, left_eye, right_eye, smoothed_y):
+        """Estimate if the head is pitched downward using facial geometry."""
+        if face_roi is None or face_roi.size == 0:
+            return smoothed_y > 0.35
+
+        face_height, face_width = face_roi.shape[:2]
+        if face_height <= 0 or face_width <= 0:
+            return smoothed_y > 0.35
+
+        left_center_y = left_eye[1] + left_eye[3] / 2.0
+        right_center_y = right_eye[1] + right_eye[3] / 2.0
+        eye_center_y = (left_center_y + right_center_y) / 2.0
+        eye_position_ratio = eye_center_y / max(1.0, float(face_height))
+
+        face_aspect_ratio = face_height / max(1.0, float(face_width))
+        prev_baseline_eye = getattr(self, "head_eye_ratio_baseline", 0.45)
+        prev_baseline_face = getattr(self, "head_face_ratio_baseline", 1.05)
+        alpha = getattr(self, "head_baseline_alpha", 0.12)
+
+        was_head_down = getattr(self, "last_head_down", False)
+        if not was_head_down:
+            if 0.22 <= eye_position_ratio <= 0.6:
+                new_eye_baseline = (1.0 - alpha) * prev_baseline_eye + alpha * eye_position_ratio
+                self.head_eye_ratio_baseline = float(np.clip(new_eye_baseline, 0.3, 0.6))
+            if 0.8 <= face_aspect_ratio <= 1.6:
+                new_face_baseline = (1.0 - alpha) * prev_baseline_face + alpha * face_aspect_ratio
+                self.head_face_ratio_baseline = float(np.clip(new_face_baseline, 0.9, 1.5))
+
+        eye_delta = eye_position_ratio - self.head_eye_ratio_baseline
+        face_delta = face_aspect_ratio - self.head_face_ratio_baseline
+
+        downward_eye = eye_delta > 0.04 or smoothed_y > 0.35
+        elongated_face = face_delta > 0.08
+
+        return downward_eye or elongated_face
 
 def main():
     """Main function"""
-    import sys
-    
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Ultra-Lightweight Gaze Tracker for Raspberry Pi and desktop systems."
+    )
+    parser.add_argument(
+        '--camera',
+        type=int,
+        help="Camera index to use (default: auto-detect first available camera)",
+        default=None
+    )
+    parser.add_argument(
+        '--list',
+        action='store_true',
+        help="List available cameras and exit"
+    )
+    parser.add_argument(
+        '--headless',
+        action='store_true',
+        help="Run in console mode without opening the camera preview window"
+    )
+    args = parser.parse_args()
+
+    if args.list:
+        tracker = SimpleGazeTracker()
+        tracker.list_cameras()
+        return
+
     print("Initializing Improved Gaze Tracker...")
     print("Features: Pupil detection, temporal smoothing, frame skipping")
     print("-" * 80)
-    
-    # Create gaze tracker instance
+
     tracker = SimpleGazeTracker()
-    
-    # Parse command line arguments for camera selection
-    camera_index = None
-    if len(sys.argv) > 1:
-        if sys.argv[1] == '--camera' and len(sys.argv) > 2:
-            try:
-                camera_index = int(sys.argv[2])
-            except ValueError:
-                print(f"Error: Invalid camera index '{sys.argv[2]}'. Must be a number.")
-                sys.exit(1)
-        elif sys.argv[1] == '--list':
-            tracker.list_cameras()
-            sys.exit(0)
-        elif sys.argv[1] == '--help':
-            print("Usage:")
-            print("  python gaze_tracker_simple.py              # Auto-detect camera")
-            print("  python gaze_tracker_simple.py --camera N    # Use camera index N")
-            print("  python gaze_tracker_simple.py --list       # List available cameras")
-            sys.exit(0)
-    
-    # Start tracking
-    tracker.run(camera_index=camera_index)
+    tracker.run(camera_index=args.camera, headless=args.headless)
 
 if __name__ == "__main__":
     main()

@@ -1,163 +1,102 @@
-# Lightweight Gaze Tracker for Raspberry Pi
+# Lightweight Gaze Tracker
 
-A very lightweight gaze tracking system that detects eye movements and prints gaze direction to the terminal. Designed specifically for Raspberry Pi with USB webcam.
-
-## Features
-
-- **Lightweight**: Optimized for Raspberry Pi performance
-- **Real-time**: Continuous gaze direction detection
-- **Terminal Output**: Prints gaze direction (LEFT, CENTER, RIGHT, BLINKING, NO_FACE)
-- **Blink Detection**: Distinguishes between gaze changes and blinking
-- **No GUI Required**: Runs headlessly for terminal-only operation
-
-## Gaze Directions
-
-- `LEFT`: Looking to the left
-- `CENTER`: Looking straight ahead
-- `RIGHT`: Looking to the right
-- `BLINKING`: Eyes are closed/blinking
-- `NO_FACE`: No face detected in frame
+Ultra-lightweight gaze tracking utility built around OpenCV Haar cascades (and optional MediaPipe landmarks). It can show a window with live annotations or run headlessly and stream text updates to the console—perfect for laptops, desktops, or a Raspberry Pi with a USB camera.
 
 ## Installation
 
-### 1. Install Dependencies
-
 ```bash
+python -m venv .venv
+. .venv/bin/activate   # Windows: .\.venv\Scripts\activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 2. Download Face Landmark Model
+On Windows you may need the precompiled OpenCV wheels (already covered by `requirements.txt`). On Raspberry Pi see the dedicated notes below.
 
-Download the dlib face landmark predictor model:
+## Running the Tracker
 
-```bash
-wget http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
-bunzip2 shape_predictor_68_face_landmarks.dat.bz2
-```
+From the `gaze tracking` directory:
 
-Or manually download from: http://dlib.net/files/shape_predictor_68_face_landmarks.dat.bz2
+- GUI with annotated camera feed  
+  ```bash
+  python gaze_tracker_simple.py
+  ```
 
-### 3. Raspberry Pi Specific Setup
+- Headless console output (no OpenCV window)  
+  ```bash
+  python gaze_tracker_simple.py --headless
+  ```
 
-For Raspberry Pi, you may need to install additional dependencies:
+- Explicit camera index  
+  ```bash
+  python gaze_tracker_simple.py --camera 1
+  ```
 
-```bash
-sudo apt-get update
-sudo apt-get install python3-opencv python3-pip
-sudo apt-get install libopenblas-dev liblapack-dev
-sudo apt-get install libx11-dev libgtk-3-dev libboost-python-dev
-```
+- List available cameras  
+  ```bash
+  python gaze_tracker_simple.py --list
+  ```
 
-## Usage
+### Keyboard Controls (GUI or headless)
 
-### Basic Usage
+`q` quit · `h` help · `w / a / s / r` capture top/left/bottom/right edges · `c` recenter. Run the calibration keys while looking at the corresponding screen edges to fine-tune left/right/up/down detection.
 
-```bash
-python3 gaze_tracker.py
-```
+## Adjusting Sensitivity & Thresholds
 
-### With Different Camera
+Most tuning knobs live near the top of `SimpleGazeTracker.__init__` in `gaze_tracker_simple.py`.
 
-If you have multiple cameras, specify the camera index:
+| Setting | Purpose | Typical tweak |
+| --- | --- | --- |
+| `self.down_offset_threshold` | How far the gaze `rel_y` must drop before counting as “eyes down” | Lower for more sensitivity, raise to avoid false positives |
+| `self.down_threshold_seconds` | Dwell time before the monitoring beep fires | Lower for faster alerts (default 1.0 s) |
+| `self.head_eye_ratio_baseline`, `self.head_face_ratio_baseline` | Initial head-pitch baselines used by `_estimate_head_down` | Set closer to your neutral posture if you always sit higher/lower |
+| `self.head_baseline_alpha` | Learning rate when updating the baseline while the head is up | Smaller = slower adaptation |
+| `_is_valid_eye_box()` constants (`min_area_ratio`, `min_vertical`, aspect thresholds) | Filters out bogus eye detections (ears, nose bridge) | Relax very cautiously if eyes are frequently missed; tightening reduces false positives |
 
-```bash
-python3 gaze_tracker.py
-```
+Workflow:
+1. Open `gaze_tracker_simple.py`.
+2. Locate the attributes above in `__init__` or in `_is_valid_eye_box`.
+3. Adjust values, save, and rerun the script (`--headless` if you prefer console mode).
 
-The script will automatically use camera index 0 (default camera).
+Tip: keep notes of the original defaults so you can revert quickly if a change makes detection worse.
 
-### Headless Operation and Gaze Point UI
+## Running on Raspberry Pi
 
-By default, the simple implementation (`gaze_tracker_simple.py`) displays a minimal "Gaze Point" window that shows a dot representing where your eyes are looking on a canvas. It does not show the camera feed.
+The tracker has been exercised on Raspberry Pi 4/5 using the 64-bit OS. Steps:
 
-Controls in the Gaze Point UI:
+1. **Prepare the OS**
+   ```bash
+   sudo apt update
+   sudo apt install python3-pip python3-opencv python3-numpy libatlas-base-dev
+   ```
+   If you plan to use MediaPipe for improved landmark quality: `pip install mediapipe-rpi4` (or the appropriate whl for your Pi).
 
-- `q`: Quit
-- `h`: Show help in terminal
-- `w` / `a` / `s` / `d`: Set top/left/bottom/right calibration edges to your CURRENT gaze
-- `c`: Set center calibration around your CURRENT gaze (re-centers ranges)
+2. **Enable the camera** (if using the CSI ribbon connector) via `raspi-config` → Interface Options → Camera. Reboot if prompted.
 
-Calibration tips:
+3. **Clone / copy the project** to the Pi and install Python dependencies  
+   ```bash
+   pip install --upgrade pip
+   pip install -r requirements.txt
+   ```
 
-- Look at the top edge of your screen and press `w` (top)
-- Look at the bottom edge and press `s` (bottom)
-- Look at the left edge and press `a` (left)
-- Look at the right edge and press `d` (right)
-- Use `c` while looking at the center to re-center the mapping
+4. **Launch the tracker**
+   ```bash
+   python3 gaze_tracker_simple.py --headless
+   ```
+   Headless mode avoids driving the X11 display and runs every frame for smoother console output. Add `--camera N` if you need to target `/dev/videoN`.
 
-This maps your relative eye position to the canvas so the dot follows your gaze more accurately for your setup.
-
-## Performance Optimization
-
-### For Raspberry Pi
-
-1. **Reduce Resolution**: Modify the camera resolution in the code if needed
-2. **Skip Frames**: Add frame skipping logic for better performance
-3. **Lower FPS**: Reduce processing frequency if CPU usage is too high
-
-### Example Optimizations
-
-```python
-# In the run() method, add frame skipping:
-frame_count = 0
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
-    
-    # Process every 3rd frame for better performance
-    if frame_count % 3 == 0:
-        gaze_direction = self.process_frame(frame)
-        # ... rest of processing
-    
-    frame_count += 1
-```
+5. **Performance tips**
+   - Reduce resolution via `cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)` / height (already done for 640×480; feel free to lower further).
+   - Increase `self.frame_skip` in `__init__` if you need to process fewer frames per second (headless mode temporarily overrides it to 1 for responsiveness).
+   - Use good lighting—Haar cascades and pupils are more reliable with even illumination.
 
 ## Troubleshooting
 
-### Common Issues
+- **No camera found**: run `python gaze_tracker_simple.py --list` and confirm the expected index appears; on Linux check `/dev/video*`.
+- **Immediate `NO_FACE` status**: adjust lighting or distance; confirm the camera feed is not black (`Frame mean brightness` print).
+- **Eyes not detected**: tweak `_is_valid_eye_box` thresholds or temporarily lower `min_area_ratio` to confirm the boxes are in range.
+- **Frequent false head-down alerts**: raise `self.down_offset_threshold` slightly or increase `self.head_baseline_alpha` so the baseline adapts to your posture faster.
 
-1. **"shape_predictor_68_face_landmarks.dat not found"**
-   - Download the model file as described in installation step 2
+## License & Contributions
 
-2. **"Could not open camera"**
-   - Check if camera is connected and recognized
-   - Try different camera indices (0, 1, 2, etc.)
-   - On Linux: `ls /dev/video*` to list available cameras
-
-3. **Poor Performance on Raspberry Pi**
-   - Reduce camera resolution
-   - Add frame skipping
-   - Close other applications
-
-4. **No Face Detection**
-   - Ensure good lighting
-   - Face should be clearly visible
-   - Try adjusting camera angle
-
-### Camera Testing
-
-Test your camera separately:
-
-```python
-import cv2
-cap = cv2.VideoCapture(0)
-ret, frame = cap.read()
-print(f"Camera working: {ret}")
-cap.release()
-```
-
-## Technical Details
-
-- **Face Detection**: Uses dlib's HOG-based face detector
-- **Landmark Detection**: 68-point facial landmark model
-- **Gaze Calculation**: Based on eye corner and pupil position ratios
-- **Blink Detection**: Eye Aspect Ratio (EAR) thresholding
-
-## License
-
-This project is open source. The dlib library and its models have their own licensing terms.
-
-## Contributing
-
-Feel free to submit issues and enhancement requests!
+Open source—feel free to file issues or PRs. Remember that OpenCV, MediaPipe, and any optional models have their own licenses; review them before redistribution.
