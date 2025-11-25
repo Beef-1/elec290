@@ -106,7 +106,7 @@ class SimpleGazeTracker:
         self.max_history = 5  # Number of frames to average
         
         # Frame skipping for lower framerate
-        self.frame_skip = 2  # Process every 2nd frame (30fps -> 15fps)
+        self.frame_skip = 1  # Process every frame (30fps)
         self.frame_counter = 0
         
         # Debug mode - show camera feed
