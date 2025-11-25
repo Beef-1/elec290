@@ -39,6 +39,13 @@ except ImportError:
     msvcrt = None
     _MSVCRT_AVAILABLE = False
 
+try:
+    import serial  # type: ignore
+    _SERIAL_AVAILABLE = True
+except ImportError:
+    serial = None
+    _SERIAL_AVAILABLE = False
+
 # Suppress OpenCV warnings
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -134,6 +141,12 @@ class SimpleGazeTracker:
         self.head_eye_ratio_baseline = 0.42
         self.head_face_ratio_baseline = 1.0
         self.head_baseline_alpha = 0.15
+        
+        # Serial port for steering wheel sensor
+        self.serial_port = None
+        self.steering_wheel_data = ""  # Store raw received data
+        self.last_steering_beep_time = None
+        self.steering_beep_cooldown = 0.5  # seconds between beeps
 
     def _check_memory_usage(self):
         """Return tuple (exceeded, current_bytes)."""
@@ -145,6 +158,58 @@ class SimpleGazeTracker:
             return rss > self.memory_limit_bytes, rss
         except Exception:
             return False, 0
+    
+    def _init_serial_port(self, port=None, baudrate=9600):
+        """Initialize serial port for steering wheel sensor."""
+        if not _SERIAL_AVAILABLE or serial is None:
+            print("WARNING: pyserial not available. Steering wheel sensor disabled.")
+            return False
+        
+        try:
+            # Try common serial ports if not specified
+            if port is None:
+                # Common Windows COM ports
+                for com_port in ['COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8']:
+                    try:
+                        self.serial_port = serial.Serial(com_port, baudrate, timeout=1)
+                        print(f"Serial port opened: {com_port} at {baudrate} baud")
+                        return True
+                    except (serial.SerialException, OSError):
+                        continue
+                print("WARNING: Could not find serial port. Steering wheel sensor disabled.")
+                return False
+            else:
+                self.serial_port = serial.Serial(port, baudrate, timeout=1)
+                print(f"Serial port opened: {port} at {baudrate} baud")
+                return True
+        except Exception as e:
+            print(f"WARNING: Failed to open serial port: {e}. Steering wheel sensor disabled.")
+            return False
+    
+    def _read_serial_port(self):
+        """Read all available data from serial port and return the raw value."""
+        if self.serial_port is None or not self.serial_port.is_open:
+            return None
+        
+        try:
+            if self.serial_port.in_waiting > 0:
+                # Read all available data (same as serialreader.py)
+                received_data = self.serial_port.read(self.serial_port.in_waiting)
+                try:
+                    # Try to decode as text
+                    decoded_data = received_data.decode('utf-8', errors='replace')
+                    # Store the decoded data
+                    self.steering_wheel_data = decoded_data.strip()
+                    return self.steering_wheel_data
+                except:
+                    # If decoding fails, store as hex
+                    hex_data = received_data.hex()
+                    self.steering_wheel_data = f"[RAW: {hex_data}]"
+                    return self.steering_wheel_data
+        except Exception:
+            pass  # Ignore read errors
+        
+        return self.steering_wheel_data if self.steering_wheel_data else None
 
     def _mediapipe_detect_face_and_eyes(self, frame):
         """Use MediaPipe FaceMesh to obtain face and eye bounding boxes."""
@@ -882,7 +947,7 @@ class SimpleGazeTracker:
         sys.stderr = old_stderr
         return available
     
-    def run(self, camera_index=None, headless=False):
+    def run(self, camera_index=None, headless=False, serial_port=None, serial_baud=9600):
         """Main loop to capture video and track gaze and display gaze point UI"""
         # If no camera specified, try to find one
         if camera_index is None:
@@ -937,6 +1002,9 @@ class SimpleGazeTracker:
         print("Press 'q' to quit | 'h' for help | 'w/a/s/r' to calibrate edges (up/left/down/right) | 'c' center")
         print("Gaze directions: LEFT, CENTER, RIGHT, UP, DOWN, UP_LEFT, UP_RIGHT, DOWN_LEFT, DOWN_RIGHT, BLINKING, NO_FACE, NO_EYES")
         print("-" * 80)
+        
+        # Initialize serial port for steering wheel sensor
+        self._init_serial_port(port=serial_port, baudrate=serial_baud)
 
         if headless:
             print("Console mode active: gaze status will update on this line.")
@@ -1026,11 +1094,35 @@ class SimpleGazeTracker:
                 
                 self.last_head_down = head_down
                 
+                # Read steering wheel state from serial port
+                steering_data = self._read_serial_port()
+                
+                # Beep if value is 0 (check both string and int)
+                if steering_data is not None:
+                    try:
+                        # Try to parse as integer
+                        value = int(steering_data.strip())
+                        if value == 0:
+                            now = time.time()
+                            if (self.last_steering_beep_time is None or
+                                    now - self.last_steering_beep_time >= self.steering_beep_cooldown):
+                                self._trigger_down_beep()
+                                self.last_steering_beep_time = now
+                    except (ValueError, AttributeError):
+                        # If not a number, check if string contains "0"
+                        if steering_data and '0' in str(steering_data):
+                            now = time.time()
+                            if (self.last_steering_beep_time is None or
+                                    now - self.last_steering_beep_time >= self.steering_beep_cooldown):
+                                self._trigger_down_beep()
+                                self.last_steering_beep_time = now
+                
                 # Only print when direction changes to reduce spam (GUI mode)
                 if gaze_direction != last_direction:
                     if not headless:
                         timestamp = time.strftime("%H:%M:%S")
-                        print(f"[{timestamp}] Gaze: {gaze_direction}")
+                        steering_display = self.steering_wheel_data if self.steering_wheel_data else "N/A"
+                        print(f"[{timestamp}] Gaze: {gaze_direction} | Serial: {steering_display}")
                     last_direction = gaze_direction
                 
                 # Update down-gaze timer
@@ -1112,6 +1204,12 @@ class SimpleGazeTracker:
         finally:
             if cap:
                 cap.release()
+            if self.serial_port is not None and self.serial_port.is_open:
+                try:
+                    self.serial_port.close()
+                    print("Serial port closed.")
+                except Exception:
+                    pass
             if headless:
                 sys.stdout.write("\n")
                 sys.stdout.flush()
@@ -1204,11 +1302,13 @@ class SimpleGazeTracker:
             rel_x = rel_y = 0.0
         detector_label = self.last_eye_detector or "unknown"
         head_status = "HEAD_DOWN" if getattr(self, "last_head_down", False) else "HEAD_UP "
+        steering_display = self.steering_wheel_data if self.steering_wheel_data else "N/A"
         status = (
             f"Gaze: {gaze_direction:<12} "
             f"rel=({rel_x:+0.3f},{rel_y:+0.3f}) "
             f"detector={detector_label} "
-            f"{head_status}"
+            f"{head_status} "
+            f"Serial: {steering_display}"
         )
         padding = max(0, self.console_line_length - len(status))
         sys.stdout.write("\r" + status + " " * padding)
@@ -1274,6 +1374,18 @@ def main():
         action='store_true',
         help="Run in console mode without opening the camera preview window"
     )
+    parser.add_argument(
+        '--serial-port',
+        type=str,
+        default=None,
+        help="Serial port for steering wheel sensor (e.g., COM3, /dev/ttyUSB0). Auto-detect if not specified."
+    )
+    parser.add_argument(
+        '--serial-baud',
+        type=int,
+        default=9600,
+        help="Baud rate for serial port (default: 9600)"
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1286,7 +1398,8 @@ def main():
     print("-" * 80)
 
     tracker = SimpleGazeTracker()
-    tracker.run(camera_index=args.camera, headless=args.headless)
+    tracker.run(camera_index=args.camera, headless=args.headless, 
+                serial_port=args.serial_port, serial_baud=args.serial_baud)
 
 if __name__ == "__main__":
     main()
