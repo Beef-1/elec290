@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Ultra-Lightweight Gaze Tracker for Raspberry Pi
-Uses only OpenCV for face and eye detection - no dlib required
+Uses only OpenCV for face and eye detection
 """
 
 import cv2  # type: ignore
