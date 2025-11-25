@@ -46,6 +46,13 @@ except ImportError:
     serial = None
     _SERIAL_AVAILABLE = False
 
+try:
+    import pygame  # type: ignore
+    _PYGAME_AVAILABLE = True
+except ImportError:
+    pygame = None
+    _PYGAME_AVAILABLE = False
+
 # Suppress OpenCV warnings
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 warnings.filterwarnings('ignore', category=UserWarning)
@@ -145,8 +152,17 @@ class SimpleGazeTracker:
         # Serial port for steering wheel sensor
         self.serial_port = None
         self.steering_wheel_data = ""  # Store raw received data
+        self.steering_wheel_state = None  # 0 = touching, 1 = not touching, None = unknown
+        self.last_steering_status_text = "steering wheel: unknown"  # Keep past value for display
         self.last_steering_beep_time = None
         self.steering_beep_cooldown = 0.5  # seconds between beeps
+        self.last_status_update_time = 0  # Track when we last updated the status line
+        self.status_update_interval = 1.0  # Force update every second
+        
+        # Not-touching timer (beep if not touching for over 3 seconds)
+        self.not_touching_threshold_seconds = 3.0
+        self.not_touching_accumulator = 0.0
+        self.last_steering_frame_time = time.time()
 
     def _check_memory_usage(self):
         """Return tuple (exceeded, current_bytes)."""
@@ -1097,32 +1113,30 @@ class SimpleGazeTracker:
                 # Read steering wheel state from serial port
                 steering_data = self._read_serial_port()
                 
-                # Beep if value is 0 (check both string and int)
+                # Determine touching/not touching state (0 = touching, 1 = not touching)
                 if steering_data is not None:
                     try:
                         # Try to parse as integer
                         value = int(steering_data.strip())
-                        if value == 0:
-                            now = time.time()
-                            if (self.last_steering_beep_time is None or
-                                    now - self.last_steering_beep_time >= self.steering_beep_cooldown):
-                                self._trigger_down_beep()
-                                self.last_steering_beep_time = now
+                        new_state = 0 if value == 0 else 1
+                        # Keep past value if no change
+                        if new_state != self.steering_wheel_state:
+                            self.steering_wheel_state = new_state
                     except (ValueError, AttributeError):
                         # If not a number, check if string contains "0"
                         if steering_data and '0' in str(steering_data):
-                            now = time.time()
-                            if (self.last_steering_beep_time is None or
-                                    now - self.last_steering_beep_time >= self.steering_beep_cooldown):
-                                self._trigger_down_beep()
-                                self.last_steering_beep_time = now
+                            new_state = 0
+                        else:
+                            new_state = 1
+                        # Keep past value if no change
+                        if new_state != self.steering_wheel_state:
+                            self.steering_wheel_state = new_state
                 
-                # Only print when direction changes to reduce spam (GUI mode)
+                # Update not-touching timer (beeps if not touching for over 3 seconds)
+                self._update_not_touching_timer()
+                
+                # Track direction changes
                 if gaze_direction != last_direction:
-                    if not headless:
-                        timestamp = time.strftime("%H:%M:%S")
-                        steering_display = self.steering_wheel_data if self.steering_wheel_data else "N/A"
-                        print(f"[{timestamp}] Gaze: {gaze_direction} | Serial: {steering_display}")
                     last_direction = gaze_direction
                 
                 # Update down-gaze timer
@@ -1133,7 +1147,11 @@ class SimpleGazeTracker:
                 
                 if headless:
                     self.last_head_down = head_down
-                    self._print_console_status(gaze_direction, rel)
+                    # Force update every second
+                    now = time.time()
+                    if now - self.last_status_update_time >= self.status_update_interval:
+                        self._print_console_status(gaze_direction, rel)
+                        self.last_status_update_time = now
                 else:
                     # Add status text overlay to display frame
                     if display_frame is not None and display_frame.size > 0:
@@ -1223,7 +1241,26 @@ class SimpleGazeTracker:
 
     def _trigger_down_beep(self):
         """Play an audible alert if available when user looks down too long."""
-        if _WINSOUND_AVAILABLE and winsound is not None:
+        # Try pygame first (cross-platform, works on Raspberry Pi)
+        if _PYGAME_AVAILABLE and pygame is not None:
+            try:
+                pygame.mixer.init(frequency=22050, size=-16, channels=1, buffer=512)
+                # Generate a beep tone
+                sample_rate = 22050
+                duration = 0.3  # seconds
+                frequency = 880  # Hz
+                frames = int(duration * sample_rate)
+                arr = np.zeros((frames,), dtype=np.float32)
+                for i in range(frames):
+                    arr[i] = np.sin(2 * np.pi * frequency * i / sample_rate)
+                arr = (arr * 32767).astype(np.int16)
+                sound = pygame.sndarray.make_sound(arr)
+                sound.play()
+                pygame.time.wait(int(duration * 1000))
+            except Exception:
+                pass
+        # Fallback to Windows winsound
+        elif _WINSOUND_AVAILABLE and winsound is not None:
             try:
                 winsound.Beep(880, 300)  # frequency in Hz, duration in ms
             except RuntimeError:
@@ -1250,6 +1287,30 @@ class SimpleGazeTracker:
         else:
             # Allow accumulator to decay toward zero to avoid immediate trigger on brief glances
             self.down_accumulator = max(0.0, self.down_accumulator - dt)
+    
+    def _update_not_touching_timer(self):
+        """Accumulate time spent not touching steering wheel and trigger alert when threshold exceeded."""
+        if self.steering_wheel_state is None:
+            # Unknown state - don't accumulate
+            return
+        
+        now = time.time()
+        dt = max(0.0, now - self.last_steering_frame_time)
+        self.last_steering_frame_time = now
+        
+        is_not_touching = (self.steering_wheel_state == 1)
+        
+        if is_not_touching:
+            self.not_touching_accumulator += dt
+            if self.not_touching_accumulator >= self.not_touching_threshold_seconds:
+                if (self.last_steering_beep_time is None or
+                        now - self.last_steering_beep_time >= self.steering_beep_cooldown):
+                    self._trigger_down_beep()
+                    self.last_steering_beep_time = now
+                    # leave accumulator as-is so we only beep again after cooldown
+        else:
+            # Touching - reset accumulator
+            self.not_touching_accumulator = 0.0
 
     def _translate_key_value(self, key_value):
         """Normalize key inputs from OpenCV or console polling into lowercase chars."""
@@ -1302,13 +1363,24 @@ class SimpleGazeTracker:
             rel_x = rel_y = 0.0
         detector_label = self.last_eye_detector or "unknown"
         head_status = "HEAD_DOWN" if getattr(self, "last_head_down", False) else "HEAD_UP "
-        steering_display = self.steering_wheel_data if self.steering_wheel_data else "N/A"
+        
+        # Show touching/not touching text, keep past value if state is None
+        if self.steering_wheel_state == 0:
+            steering_status = "touching the steering wheel (0)"
+            self.last_steering_status_text = steering_status
+        elif self.steering_wheel_state == 1:
+            steering_status = "not touching the steering wheel (1)"
+            self.last_steering_status_text = steering_status
+        else:
+            # Keep past value if no change
+            steering_status = self.last_steering_status_text
+        
         status = (
             f"Gaze: {gaze_direction:<12} "
             f"rel=({rel_x:+0.3f},{rel_y:+0.3f}) "
             f"detector={detector_label} "
             f"{head_status} "
-            f"Serial: {steering_display}"
+            f"{steering_status}"
         )
         padding = max(0, self.console_line_length - len(status))
         sys.stdout.write("\r" + status + " " * padding)
