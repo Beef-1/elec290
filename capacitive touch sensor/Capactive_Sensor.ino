@@ -5,10 +5,10 @@
 #define in A5
 unsigned int period, quarPeriod, halfPeriod; //us
 unsigned long lastTime,cutOff;
-int phase, read, count;
+int phase, read, count, touched;
 
 void setup() {
-  cutOff = 700;
+  cutOff = 900;
   period = 1000000/Frequency; //us
   halfPeriod = period/2; //us
   quarPeriod = halfPeriod/2; //us
@@ -16,6 +16,7 @@ void setup() {
   phase = 0;
   read = 0;
   count = 0;
+  touched = 0;
   pinMode(trig,OUTPUT);
   pinMode(out,OUTPUT);
   pinMode(in,INPUT);
@@ -31,7 +32,13 @@ void loop() {
   }
   if(phase == 1 && micros()-lastTime >= quarPeriod){
     read = analogRead(in);
+    
     read = (read > cutOff);
+    if (read == 1){
+      touched +=1;
+      if (touched <10) read = 0;
+    }
+    else touched = 0;
     if (count%1000 == 0) Serial.println(read);
     digitalWrite(out,(read)?HIGH:LOW);
     
